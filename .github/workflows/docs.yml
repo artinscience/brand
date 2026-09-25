@@ -1,0 +1,105 @@
+name: docs
+
+# The standing rule is that the documentation reflects every PR. This is the
+# mechanical half of holding to it: `artinscience-docsgate --ci` fails a PR
+# that changes anything but prose without changing any prose, or that leaves a
+# path, link or cited image the docs name unresolved. A PR that is only prose,
+# or that removes headings, markers or dated lines, passes and is labelled
+# `human-review` — those are judgements, and the review is the human's.
+#
+# THE SAME FILE IS IN EVERY REPO. The canonical copy is core's
+# `.github/workflows/docs.yml`; change it there and copy it to the others. It
+# is copied rather than called as a reusable workflow because core is private
+# and a public repo cannot call a private repo's workflow.
+#
+# The gate reads the whole workspace, not one repo — a change here is often
+# described in another repo's docs — so every sibling is cloned beside this one.
+# That needs `WORKSPACE_READ_TOKEN`: a fine-grained token with read-only
+# Contents on the artinscience repos. Without it the job fails rather than
+# checking one repo and reporting clean, because "could not ask" is not
+# "clean".
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write          # creating the label
+  pull-requests: write   # applying it
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      # The PR's merge commit and its first parent, so HEAD^1..HEAD is
+      # exactly what merging would change.
+      - uses: actions/checkout@v4
+        with:
+          path: ws/${{ github.event.repository.name }}
+          fetch-depth: 2
+
+      - name: Clone the rest of the workspace
+        env:
+          TOKEN: ${{ secrets.WORKSPACE_READ_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          SELF: ${{ github.event.repository.name }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::WORKSPACE_READ_TOKEN is not set — the gate cannot see the workspace, and a partial check is not a pass"
+            exit 1
+          fi
+          # The repos the TOKEN can read, private included. `gh repo list`
+          # returns only the public ones for a fine-grained token, and that
+          # failed quietly: the gate ran against half the workspace and passed.
+          repos=$(GH_TOKEN="$TOKEN" gh api --paginate 'user/repos?affiliation=owner' \
+                    -q ".[] | select(.owner.login == \"$OWNER\" and (.archived | not)) | .name")
+          # core is private, so its absence means the private repos are not
+          # visible — the half-workspace case, which must not pass.
+          echo "$repos" | grep -qx core || {
+            echo "::error::the token cannot see the private repos — the gate would check half the workspace"
+            exit 1
+          }
+          n=0
+          for r in $repos; do
+            [ "$r" = "$SELF" ] && continue
+            git clone -q --depth 1 \
+              "https://x-access-token:${TOKEN}@github.com/${OWNER}/${r}.git" "ws/$r"
+            n=$((n + 1))
+          done
+          echo "cloned $n sibling repo(s)"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # The gate is stdlib-only, so it runs from core's source with nothing
+      # installed. In a core PR that is the PR's own gate — a change to the
+      # gate is checked by itself.
+      - name: Docs gate
+        id: gate
+        working-directory: ws
+        env:
+          PYTHONPATH: ${{ github.workspace }}/ws/core/src
+          ARTINSCIENCE_WORKSPACE: ${{ github.workspace }}/ws
+        run: |
+          python -m artinscience.docsgate.cli --ci \
+            --repo "${{ github.event.repository.name }}" \
+            --spec 'HEAD^1..HEAD' \
+            ${{ github.event.repository.private && ' ' || '--public' }}
+
+      - name: Label for human review
+        if: always() && steps.gate.outputs.human_review != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create human-review --repo "$GITHUB_REPOSITORY" --force \
+            --color D93F0B --description "prose to read, not only a diff to check"
+          if [ "${{ steps.gate.outputs.human_review }}" = true ]; then
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label human-review
+          else
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label human-review || true
+          fi
